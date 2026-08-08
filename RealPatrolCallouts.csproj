@@ -13,6 +13,9 @@
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
+  <PropertyGroup>
+    <GtaVPath>C:\Program Files (x86)\Steam\steamapps\common\Grand Theft Auto V</GtaVPath>
+  </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
@@ -31,8 +34,13 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="RagePluginHook">
+      <HintPath>$(GtaVPath)\RagePluginHook.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="LSPD First Response">
-      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Grand Theft Auto V\plugins\LSPD First Response.dll</HintPath>
+      <HintPath>$(GtaVPath)\plugins\LSPDFR\LSPD First Response.dll</HintPath>
+      <Private>False</Private>
     </Reference>
     <Reference Include="RAGENativeUI">
       <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Grand Theft Auto V\RAGENativeUI.dll</HintPath>
