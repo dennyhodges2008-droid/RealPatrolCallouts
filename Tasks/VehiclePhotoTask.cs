@@ -331,7 +331,7 @@ namespace RealPatrolCallouts.Tasks
             Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Camera prop created");
 
             int boneIndex = NativeFunction.Natives.GET_PED_BONE_INDEX<int>(player, CameraHandBoneId);
-            _cameraProp.AttachTo(player, boneIndex, Vector3.Zero, Vector3.Zero);
+            _cameraProp.AttachTo(player, boneIndex, Vector3.Zero, new Rotator(0f, 0f, 0f));
 
             Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Camera prop attached");
         }
