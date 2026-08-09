@@ -16,7 +16,7 @@ namespace RealPatrolCallouts.Callouts
             CalloutMessage = "Test Callout";
 
             AddMinimumDistanceCheck(10f, _calloutPosition);
-            ShowCalloutAreaBlipBeforeAccepting(50f);
+            ShowCalloutAreaBlipBeforeAccepting(_calloutPosition, 30f);
 
             Game.LogTrivial("RealPatrolCallouts: TestCallout offered");
 
