@@ -28,12 +28,12 @@ namespace RealPatrolCallouts.Callouts
         private enum ScenePhase
         {
             AwaitingArrival,
-            PhotographingVehicle1,
-            PhotographingVehicle2,
+            PhotographingScene,
             PhotographsComplete
         }
 
         private Vector3 _calloutPosition;
+        private float _sceneHeading;
 
         private Blip _sceneBlip;
         private Vehicle _vehicle1;
@@ -41,8 +41,7 @@ namespace RealPatrolCallouts.Callouts
         private Ped _driver1;
         private Ped _driver2;
 
-        private VehiclePhotoTask _photoTask1;
-        private VehiclePhotoTask _photoTask2;
+        private ScenePhotoTask _photoTask;
 
         private DriverDialogueTask _dialogueTask1;
         private DriverDialogueTask _dialogueTask2;
@@ -107,23 +106,15 @@ namespace RealPatrolCallouts.Callouts
 
             bool activePhotoMarkerInRange = false;
 
-            // VehiclePhotoTask has no visible markers - it checks the player's distance to
-            // all six invisible photo positions and handles its own T-press interaction on
-            // a dedicated GameFiber, so it no longer needs a per-tick Process() call here -
+            // ScenePhotoTask has no visible markers - it checks the player's distance to
+            // all eight invisible scene photo zones and handles its own T-press interaction
+            // on a dedicated GameFiber, so it no longer needs a per-tick Process() call here -
             // only its resulting state is read.
             switch (_phase)
             {
-                case ScenePhase.PhotographingVehicle1:
-                    activePhotoMarkerInRange = _photoTask1.IsPlayerInActiveMarkerRange;
-                    if (_photoTask1.IsComplete)
-                    {
-                        StartVehicle2Photos();
-                    }
-                    break;
-
-                case ScenePhase.PhotographingVehicle2:
-                    activePhotoMarkerInRange = _photoTask2.IsPlayerInActiveMarkerRange;
-                    if (_photoTask2.IsComplete)
+                case ScenePhase.PhotographingScene:
+                    activePhotoMarkerInRange = _photoTask.IsPlayerInActiveZoneRange;
+                    if (_photoTask.IsComplete)
                     {
                         CompletePhotographs();
                     }
@@ -138,8 +129,7 @@ namespace RealPatrolCallouts.Callouts
 
         public override void End()
         {
-            _photoTask1?.Stop();
-            _photoTask2?.Stop();
+            _photoTask?.Stop();
 
             if (_sceneBlip != null && _sceneBlip.Exists())
             {
@@ -175,6 +165,7 @@ namespace RealPatrolCallouts.Callouts
         private void SpawnScene()
         {
             float roadHeading = GetRoadHeading(_calloutPosition);
+            _sceneHeading = roadHeading;
             float headingRadians = roadHeading * (float)(Math.PI / 180.0);
 
             Vector3 forward = new Vector3(-(float)Math.Sin(headingRadians), (float)Math.Cos(headingRadians), 0f);
@@ -202,8 +193,7 @@ namespace RealPatrolCallouts.Callouts
             _driver1 = SpawnStandingDriver("a_m_y_business_01", _vehicle1, new Vector3(-2.5f, 0f, 0f));
             _driver2 = SpawnStandingDriver("a_f_y_business_02", _vehicle2, new Vector3(2.5f, 0f, 0f));
 
-            _photoTask1 = new VehiclePhotoTask(_vehicle1, "Vehicle 1");
-            _photoTask2 = new VehiclePhotoTask(_vehicle2, "Vehicle 2");
+            _photoTask = new ScenePhotoTask(new[] { _vehicle1, _vehicle2 }, _sceneHeading, "Accident scene");
 
             _dialogueTask1 = new DriverDialogueTask(
                 _driver1,
@@ -295,29 +285,22 @@ namespace RealPatrolCallouts.Callouts
                 _sceneBlip.IsRouteEnabled = false;
             }
 
-            Game.DisplayHelp("The vehicles at the scene need to be photographed.");
+            Game.DisplayHelp("The accident scene needs to be photographed.");
             Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision player arrived at scene");
 
-            StartVehicle1Photos();
+            StartScenePhotos();
         }
 
-        private void StartVehicle1Photos()
+        private void StartScenePhotos()
         {
-            _phase = ScenePhase.PhotographingVehicle1;
-            _photoTask1.Start();
-        }
-
-        private void StartVehicle2Photos()
-        {
-            _phase = ScenePhase.PhotographingVehicle2;
-            _photoTask2.Start();
+            _phase = ScenePhase.PhotographingScene;
+            _photoTask.Start();
         }
 
         private void CompletePhotographs()
         {
             _phase = ScenePhase.PhotographsComplete;
 
-            Game.DisplayNotification("Accident scene photographs complete.");
             Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision scene photographs complete");
         }
 
