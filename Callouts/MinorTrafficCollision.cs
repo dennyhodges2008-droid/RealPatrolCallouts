@@ -336,7 +336,7 @@ namespace RealPatrolCallouts.Callouts
             Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Initial investigation started");
         }
 
-        // ----- Stage 1: initial investigation (injury check, interview, ID collection) -----
+        // ----- Stage 1: initial investigation (injury check + interview per driver) -----
 
         private void ProcessInitialInvestigation()
         {
@@ -363,7 +363,7 @@ namespace RealPatrolCallouts.Callouts
 
             if (AllInterviewsComplete())
             {
-                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: All participants interviewed");
+                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: All driver interviews completed");
                 BeginPhotography();
             }
         }
@@ -398,26 +398,28 @@ namespace RealPatrolCallouts.Callouts
 
         private void CompleteInterview(AccidentParticipant participant)
         {
+            // InterviewCompleted is the only requirement for this driver's investigation
+            // stage - it is never reset for the rest of the callout, so once this fires
+            // the "speak with driver" interaction can never appear again for them.
             participant.InterviewCompleted = true;
-            participant.IdCollected = true;
             participant.DisplayName = PersonaHelper.GetDisplayName(participant.Driver);
 
             string dob = PersonaHelper.GetDateOfBirthText(participant.Driver);
-            string idMessage = "ID Collected: " + participant.DisplayName;
+            string idMessage = "Driver identified: " + participant.DisplayName;
             if (!string.IsNullOrEmpty(dob))
             {
                 idMessage += " (DOB " + dob + ")";
             }
 
             Game.DisplayNotification("~b~" + idMessage);
-            Game.LogTrivial($"RealPatrolCallouts: MinorTrafficCollision: Driver {participant.Number} interview complete / ID collected");
+            Game.LogTrivial($"RealPatrolCallouts: MinorTrafficCollision: Driver {participant.Number} conversation completed");
         }
 
         private bool AllInterviewsComplete()
         {
             foreach (AccidentParticipant participant in _participants)
             {
-                if (!participant.InterviewCompleted || !participant.IdCollected)
+                if (!participant.InterviewCompleted)
                 {
                     return false;
                 }
@@ -441,8 +443,9 @@ namespace RealPatrolCallouts.Callouts
         {
             _stage = CalloutStage.ReportPreparation;
 
-            Game.DisplayNotification("~b~Return to your patrol vehicle to complete your checks and crash report.");
-            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Photography complete");
+            Game.DisplayNotification("~b~Return to your patrol vehicle to complete the crash report.");
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Photography completed");
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Entered ReportPreparation state");
 
             _reportConfirmationTask = new CrashReportConfirmationTask(_responseVehicle);
         }
@@ -452,6 +455,7 @@ namespace RealPatrolCallouts.Callouts
         private void BeginReportDistribution()
         {
             _stage = CalloutStage.ReportDistribution;
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Entered ReportDistribution state");
 
             _reportDistributionTask = new ReportDistributionTask(_participants);
             _reportDistributionTask.Start();

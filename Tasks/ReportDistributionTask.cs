@@ -72,6 +72,10 @@ namespace RealPatrolCallouts.Tasks
         public void Start()
         {
             _isActive = true;
+            // Seed from the live key state rather than assuming it's up - T may still be
+            // held from the press that completed the crash report in the previous stage,
+            // and that must not be able to cascade into an immediate "give report".
+            _keyWasDown = Game.IsKeyDown(_interactionKey);
             _fiber = GameFiber.StartNew(RunLoop, "ReportDistributionTask");
         }
 

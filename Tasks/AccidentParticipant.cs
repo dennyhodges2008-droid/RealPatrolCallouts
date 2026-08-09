@@ -18,9 +18,12 @@ namespace RealPatrolCallouts.Tasks
 
         public DriverDialogueTask InterviewTask { get; }
 
+        /// <summary>
+        /// The only requirement for this participant's investigation stage. Set once their
+        /// scripted interview dialogue finishes; nothing else (no separate ID/ped check) gates
+        /// progression, and this never resets for the rest of the callout.
+        /// </summary>
         public bool InterviewCompleted { get; set; }
-
-        public bool IdCollected { get; set; }
 
         public bool ReportGiven { get; set; }
 

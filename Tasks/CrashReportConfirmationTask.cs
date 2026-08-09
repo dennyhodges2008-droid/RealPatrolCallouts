@@ -17,14 +17,16 @@ namespace RealPatrolCallouts.Tasks
         private readonly Vehicle _preferredVehicle;
         private readonly Keys _interactionKey;
 
-        private Vehicle _reportVehicle;
-        private bool _instructionShown;
+        private bool _wasInReportVehicle;
+        private bool _vehicleEntryLogged;
+        private bool _promptLogged;
         private bool _keyWasDown;
 
         public CrashReportConfirmationTask(Vehicle preferredVehicle, Keys interactionKey = Keys.T)
         {
             _preferredVehicle = preferredVehicle;
             _interactionKey = interactionKey;
+            _keyWasDown = Game.IsKeyDown(interactionKey);
         }
 
         public bool IsComplete { get; private set; }
@@ -39,29 +41,36 @@ namespace RealPatrolCallouts.Tasks
             Ped player = Game.LocalPlayer.Character;
             Vehicle current = player.CurrentVehicle;
 
-            if (_reportVehicle == null)
+            if (!IsReportVehicle(current))
             {
-                if (!TryIdentifyReportVehicle(current))
-                {
-                    _keyWasDown = false;
-                    return;
-                }
-            }
-
-            if (!_reportVehicle.Exists() || current != _reportVehicle)
-            {
+                _wasInReportVehicle = false;
                 _keyWasDown = false;
                 return;
             }
 
-            if (!_instructionShown)
+            if (!_wasInReportVehicle)
             {
-                Game.DisplayNotification("~b~Complete the driver checks and crash report in your MDT.");
-                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Waiting for crash report");
-                _instructionShown = true;
+                // The player just sat down in a valid vehicle - this interaction is only
+                // now starting to own T, so seed the debounce from the live key state
+                // instead of assuming it's up (it may still be held from a press in the
+                // previous stage).
+                _wasInReportVehicle = true;
+                _keyWasDown = Game.IsKeyDown(_interactionKey);
+
+                if (!_vehicleEntryLogged)
+                {
+                    _vehicleEntryLogged = true;
+                    Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Player entered valid report vehicle");
+                }
             }
 
-            Game.DisplayHelp("Press " + _interactionKey + " when the crash report is complete.");
+            if (!_promptLogged)
+            {
+                _promptLogged = true;
+                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Showing report completion prompt");
+            }
+
+            Game.DisplayHelp("Press " + _interactionKey + " to complete crash report");
 
             bool keyDown = Game.IsKeyDown(_interactionKey);
             bool keyJustPressed = keyDown && !_keyWasDown;
@@ -71,34 +80,33 @@ namespace RealPatrolCallouts.Tasks
             {
                 IsComplete = true;
 
-                Game.DisplayNotification("~b~Crash report completed. Provide a copy to each involved driver.");
-                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Crash report confirmed complete");
+                Game.DisplayNotification("~b~Crash report complete. Give a copy to each driver.");
+                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Crash report completed");
             }
         }
 
         /// <summary>
-        /// Prefers the vehicle the player actually responded in. If that reference is
-        /// unavailable (not captured, or it no longer exists), falls back to accepting the
-        /// first valid police vehicle the player gets into during this stage.
+        /// The simplest reliable rule: any vehicle the player is currently seated in that is
+        /// recognized as a police/emergency vehicle counts. The originally-captured response
+        /// vehicle is preferred when it's still valid (an exact match always counts, even in
+        /// the rare case the police-vehicle native doesn't flag it), but that preference can
+        /// never be the sole gate - it must never block the prompt from appearing for a
+        /// legitimate police vehicle just because it isn't the exact original reference.
         /// </summary>
-        private bool TryIdentifyReportVehicle(Vehicle current)
+        private bool IsReportVehicle(Vehicle current)
         {
-            if (current == null)
+            if (current == null || !current.Exists())
             {
                 return false;
             }
 
             bool preferredValid = _preferredVehicle != null && _preferredVehicle.Exists();
-            bool isCandidate = preferredValid ? current == _preferredVehicle : IsPoliceVehicle(current);
-
-            if (!isCandidate)
+            if (preferredValid && current == _preferredVehicle)
             {
-                return false;
+                return true;
             }
 
-            _reportVehicle = current;
-            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Report vehicle identified");
-            return true;
+            return IsPoliceVehicle(current);
         }
 
         private static bool IsPoliceVehicle(Vehicle vehicle)
