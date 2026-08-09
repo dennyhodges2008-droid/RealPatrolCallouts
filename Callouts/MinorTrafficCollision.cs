@@ -107,8 +107,9 @@ namespace RealPatrolCallouts.Callouts
 
             bool activePhotoMarkerInRange = false;
 
-            // VehiclePhotoTask renders its marker and handles its own T-press interaction
-            // on a dedicated GameFiber, so it no longer needs a per-tick Process() call here -
+            // VehiclePhotoTask has no visible markers - it checks the player's distance to
+            // all six invisible photo positions and handles its own T-press interaction on
+            // a dedicated GameFiber, so it no longer needs a per-tick Process() call here -
             // only its resulting state is read.
             switch (_phase)
             {
