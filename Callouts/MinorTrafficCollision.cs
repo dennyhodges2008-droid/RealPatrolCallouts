@@ -27,6 +27,22 @@ namespace RealPatrolCallouts.Callouts
         private const float MinVehicle2Rotation = 10f;
         private const float MaxVehicle2Rotation = 25f;
 
+        // Location selection/validation. GTA's vehicle-node network includes dirt paths,
+        // service paths, and parking areas alongside normal roads, so a single street-node
+        // lookup is not sufficient - candidates are validated before use (see
+        // TryFindValidatedScenePosition).
+        private const int MaxLocationAttempts = 20;
+
+        // Vehicle node search radius/type used for GET_CLOSEST_VEHICLE_NODE_WITH_HEADING and
+        // GET_NTH_CLOSEST_VEHICLE_NODE_ID. nodeType/nodeFlags 1 = "any dry path" (see
+        // gtaforums.com/topic/843561-pathfind-node-types).
+        private const int VehicleNodeType = 1;
+        private const float VehicleNodeSearchRadius = 3.0f;
+
+        // Bit 0 of the flags returned by GET_VEHICLE_NODE_PROPERTIES marks the node OffRoad
+        // (matches Flags1 bit 0 in the underlying .ynd path node data).
+        private const int OffRoadNodeFlagBit = 0x1;
+
         // Code 2 motor vehicle accident dispatch. IN_OR_ON_POSITION lets LSPDFR splice in its
         // own location/street audio using CalloutPosition. Code 3 phrasing exists in the same
         // scanner set for future serious-injury/multi-vehicle callouts - not used here.
@@ -51,6 +67,7 @@ namespace RealPatrolCallouts.Callouts
         }
 
         private Vector3 _calloutPosition;
+        private float _calloutHeading;
         private float _sceneHeading;
 
         private Blip _sceneBlip;
@@ -71,7 +88,11 @@ namespace RealPatrolCallouts.Callouts
 
         public override bool OnBeforeCalloutDisplayed()
         {
-            _calloutPosition = FindScenePosition();
+            if (!TryFindValidatedScenePosition(out _calloutPosition, out _calloutHeading))
+            {
+                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision declined: no valid roadway location found");
+                return false;
+            }
 
             CalloutPosition = _calloutPosition;
             CalloutMessage = "Minor Traffic Collision";
@@ -194,25 +215,164 @@ namespace RealPatrolCallouts.Callouts
             base.End();
         }
 
-        private static Vector3 FindScenePosition()
+        // Generates candidate positions 300-700m from the player and validates each one
+        // against GTA's PATHFIND road/node natives before accepting it, rejecting dirt
+        // paths, service paths, off-road areas, and parking areas that a bare
+        // World.GetNextPositionOnStreet/vehicle-node lookup would otherwise accept.
+        private static bool TryFindValidatedScenePosition(out Vector3 position, out float heading)
         {
             Vector3 playerPosition = Game.LocalPlayer.Character.Position;
-
             var rng = new Random();
-            float distance = MinCalloutDistance + (float)(rng.NextDouble() * (MaxCalloutDistance - MinCalloutDistance));
-            float angleRadians = (float)(rng.NextDouble() * 2.0 * Math.PI);
 
-            Vector3 roughOffset = new Vector3(
-                (float)Math.Sin(angleRadians) * distance,
-                (float)Math.Cos(angleRadians) * distance,
-                0f);
+            for (int attempt = 1; attempt <= MaxLocationAttempts; attempt++)
+            {
+                float distance = MinCalloutDistance + (float)(rng.NextDouble() * (MaxCalloutDistance - MinCalloutDistance));
+                float angleRadians = (float)(rng.NextDouble() * 2.0 * Math.PI);
 
-            return World.GetNextPositionOnStreet(playerPosition + roughOffset);
+                Vector3 roughOffset = new Vector3(
+                    (float)Math.Sin(angleRadians) * distance,
+                    (float)Math.Cos(angleRadians) * distance,
+                    0f);
+
+                if (TryValidateRoadwayCandidate(playerPosition + roughOffset, attempt, out Vector3 candidatePosition, out float candidateHeading))
+                {
+                    position = candidatePosition;
+                    heading = candidateHeading;
+                    return true;
+                }
+            }
+
+            Game.LogTrivial($"RealPatrolCallouts: MinorTrafficCollision: No valid roadway location found after {MaxLocationAttempts} attempts");
+
+            position = Vector3.Zero;
+            heading = 0f;
+            return false;
+        }
+
+        // Validates a single rough candidate position as a normal traffic-bearing roadway:
+        // 1) snap to the closest vehicle-road node (with heading), 2) reject nodes GTA
+        // itself reports as switched-off/off-road, 3) reject positions IS_POINT_ON_ROAD
+        // disagrees with, 4) log node density/flags and reject only the case where the
+        // node is both silent (density 0) and separately flagged off-road, so quiet
+        // residential streets are not broken.
+        private static bool TryValidateRoadwayCandidate(Vector3 roughPosition, int attempt, out Vector3 position, out float heading)
+        {
+            position = Vector3.Zero;
+            heading = 0f;
+
+            bool nodeFound;
+            Vector3 nodePosition;
+            float nodeHeading;
+            try
+            {
+                nodeFound = NativeFunction.Natives.GET_CLOSEST_VEHICLE_NODE_WITH_HEADING<bool>(
+                    roughPosition.X, roughPosition.Y, roughPosition.Z,
+                    out nodePosition, out nodeHeading,
+                    VehicleNodeType, VehicleNodeSearchRadius, 0f);
+            }
+            catch (Exception)
+            {
+                nodeFound = false;
+                nodePosition = Vector3.Zero;
+                nodeHeading = 0f;
+            }
+
+            if (!nodeFound)
+            {
+                Game.LogTrivial($"RealPatrolCallouts: Accident location rejected: invalid vehicle node (attempt {attempt}/{MaxLocationAttempts})");
+                return false;
+            }
+
+            int nodeId;
+            try
+            {
+                nodeId = NativeFunction.Natives.GET_NTH_CLOSEST_VEHICLE_NODE_ID<int>(
+                    nodePosition.X, nodePosition.Y, nodePosition.Z,
+                    1, VehicleNodeType, VehicleNodeSearchRadius, 0f);
+            }
+            catch (Exception)
+            {
+                nodeId = 0;
+            }
+
+            if (nodeId == 0)
+            {
+                Game.LogTrivial($"RealPatrolCallouts: Accident location rejected: invalid vehicle node (attempt {attempt}/{MaxLocationAttempts})");
+                return false;
+            }
+
+            bool switchedOff;
+            try
+            {
+                switchedOff = NativeFunction.Natives.GET_VEHICLE_NODE_IS_SWITCHED_OFF<bool>(nodeId);
+            }
+            catch (Exception)
+            {
+                // If the native can't be resolved, fall through to the remaining checks
+                // rather than silently accepting an unvalidated node.
+                switchedOff = false;
+            }
+
+            if (switchedOff)
+            {
+                Game.LogTrivial($"RealPatrolCallouts: Accident location rejected: off-road vehicle node (attempt {attempt}/{MaxLocationAttempts})");
+                return false;
+            }
+
+            bool onRoad;
+            try
+            {
+                onRoad = NativeFunction.Natives.IS_POINT_ON_ROAD<bool>(
+                    nodePosition.X, nodePosition.Y, nodePosition.Z, 0);
+            }
+            catch (Exception)
+            {
+                onRoad = false;
+            }
+
+            if (!onRoad)
+            {
+                Game.LogTrivial($"RealPatrolCallouts: Accident location rejected: not on road (attempt {attempt}/{MaxLocationAttempts})");
+                return false;
+            }
+
+            int density = -1;
+            int flags = 0;
+            try
+            {
+                NativeFunction.Natives.GET_VEHICLE_NODE_PROPERTIES<bool>(
+                    nodePosition.X, nodePosition.Y, nodePosition.Z,
+                    out density, out flags);
+            }
+            catch (Exception)
+            {
+                density = -1;
+                flags = 0;
+            }
+
+            bool flaggedOffRoad = (flags & OffRoadNodeFlagBit) != 0;
+            if (density == 0 && flaggedOffRoad)
+            {
+                Game.LogTrivial($"RealPatrolCallouts: Accident location rejected: off-road vehicle node (attempt {attempt}/{MaxLocationAttempts})");
+                return false;
+            }
+
+            Game.LogTrivial("RealPatrolCallouts: Accident road location accepted");
+            Game.LogTrivial($"RealPatrolCallouts: Position: {nodePosition.X:F1}/{nodePosition.Y:F1}/{nodePosition.Z:F1}");
+            Game.LogTrivial($"RealPatrolCallouts: Heading: {nodeHeading:F1}");
+            Game.LogTrivial($"RealPatrolCallouts: Traffic density: {density}");
+            Game.LogTrivial($"RealPatrolCallouts: Node flags: {flags}");
+
+            position = nodePosition;
+            heading = nodeHeading;
+            return true;
         }
 
         private void SpawnScene()
         {
-            float roadHeading = GetRoadHeading(_calloutPosition);
+            // Heading comes from the validated road node found during location selection
+            // (TryFindValidatedScenePosition), not a fresh lookup.
+            float roadHeading = _calloutHeading;
             _sceneHeading = roadHeading;
             float headingRadians = roadHeading * (float)(Math.PI / 180.0);
 
@@ -298,29 +458,6 @@ namespace RealPatrolCallouts.Callouts
             driver.Tasks.StandStill(-1);
 
             return driver;
-        }
-
-        private static float GetRoadHeading(Vector3 position)
-        {
-            try
-            {
-                bool found = NativeFunction.Natives.GET_CLOSEST_VEHICLE_NODE_WITH_HEADING<bool>(
-                    position.X, position.Y, position.Z,
-                    out Vector3 nodePosition, out float nodeHeading,
-                    1, 3.0f, 0f);
-
-                if (found)
-                {
-                    return nodeHeading;
-                }
-            }
-            catch (Exception)
-            {
-                // Fall back to a default heading if this native's signature differs on the
-                // installed game/RPH build - the scene will still spawn, just unaligned.
-            }
-
-            return 0f;
         }
 
         private void CheckForArrival()
