@@ -29,8 +29,10 @@ namespace RealPatrolCallouts
             Game.LogTrivial("RealPatrolCallouts: player went on duty");
 
             Functions.RegisterCallout(typeof(TestCallout));
-
             Game.LogTrivial("RealPatrolCallouts: TestCallout registered");
+
+            Functions.RegisterCallout(typeof(MinorTrafficCollision));
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision registered");
         }
     }
 }
