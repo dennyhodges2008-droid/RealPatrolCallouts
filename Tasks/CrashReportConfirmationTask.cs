@@ -118,7 +118,7 @@ namespace RealPatrolCallouts.Tasks
 
             try
             {
-                return Functions.IsVehiclePoliceVehicle(vehicle);
+                return vehicle.IsPoliceVehicle;
             }
             catch (Exception)
             {
