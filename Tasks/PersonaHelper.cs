@@ -22,7 +22,7 @@ namespace RealPatrolCallouts.Tasks
         {
             try
             {
-                object persona = Functions.GetPersonaByPed(ped);
+                object persona = Functions.GetPersonaForPed(ped);
                 if (persona == null)
                 {
                     return "Unknown Driver";
@@ -45,7 +45,7 @@ namespace RealPatrolCallouts.Tasks
         {
             try
             {
-                object persona = Functions.GetPersonaByPed(ped);
+                object persona = Functions.GetPersonaForPed(ped);
                 if (persona == null)
                 {
                     return null;
