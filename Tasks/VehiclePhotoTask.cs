@@ -10,46 +10,51 @@ namespace RealPatrolCallouts.Tasks
     /// Reusable six-position "walk around the vehicle and photograph it" task.
     /// Photo spots are calculated once (relative to the target vehicle's own
     /// position/heading) when the task starts, not recalculated every frame.
-    /// Only one visible marker exists at a time - the one for the current spot.
+    /// A dedicated GameFiber redraws the single active marker and checks for
+    /// the photo trigger every frame while the task is active.
     /// </summary>
     public class VehiclePhotoTask
     {
         private const float TriggerRadius = 1.5f;
 
-        // GTA native DRAW_MARKER type IDs. The numbered markers (11-16) render the
-        // digit 1-6 in 3D so the player can tell at a glance which photo is next;
-        // vertical cylinder (1) is the fallback if a numbered marker fails to draw.
-        private const int MarkerTypeNumber1 = 11;
-        private const int MarkerTypeNumber2 = 12;
-        private const int MarkerTypeNumber3 = 13;
-        private const int MarkerTypeNumber4 = 14;
-        private const int MarkerTypeNumber5 = 15;
-        private const int MarkerTypeNumber6 = 16;
+        // GTA native DRAW_MARKER type IDs: 1 = vertical cylinder (shows WHERE to
+        // stand), 11-16 = numbered markers 1-6 (shows WHICH photo is next). Both
+        // are drawn at the same location for the single active photo spot.
         private const int MarkerTypeVerticalCylinder = 1;
 
-        private static readonly int[] MarkerTypeNumbers =
-        {
-            MarkerTypeNumber1, MarkerTypeNumber2, MarkerTypeNumber3,
-            MarkerTypeNumber4, MarkerTypeNumber5, MarkerTypeNumber6,
-        };
+        private static readonly int[] MarkerTypeNumbers = { 11, 12, 13, 14, 15, 16 };
 
-        // Bright blue, large enough to read from the opposite side of the vehicle.
-        private static readonly Vector3 NumberedMarkerScale = new Vector3(2.0f, 2.0f, 2.0f);
-        private static readonly Vector3 CylinderMarkerScale = new Vector3(2.25f, 2.25f, 1.5f);
-        private const int MarkerColorR = 30;
-        private const int MarkerColorG = 144;
+        private static readonly Vector3 CylinderMarkerScale = new Vector3(1.5f, 1.5f, 0.35f);
+        private static readonly Vector3 NumberMarkerScale = new Vector3(1.0f, 1.0f, 1.0f);
+        private const float NumberMarkerHeightOffset = 0.4f;
+
+        private const int MarkerColorR = 0;
+        private const int MarkerColorG = 120;
         private const int MarkerColorB = 255;
-        private const int MarkerAlpha = 230;
+        private const int MarkerAlpha = 180;
 
+        // Throttle for the "Rendering photo marker X" log line - DRAW_MARKER itself
+        // still runs every frame, only the log call is rate-limited.
+        private const int MarkerLogIntervalMs = 3000;
+
+        // Offsets are relative to the vehicle's own position/heading via
+        // GetOffsetPosition, then snapped to ground level (see CalculatePhotoSpots).
         private static readonly Vector3[] LocalPhotoOffsets =
         {
-            new Vector3(0f, 7.5f, 0f),      // 1. Front
-            new Vector3(5.5f, 5.5f, 0f),    // 2. Front-right
-            new Vector3(5.5f, -5.5f, 0f),   // 3. Rear-right
-            new Vector3(0f, -7.5f, 0f),     // 4. Rear
-            new Vector3(-5.5f, -5.5f, 0f),  // 5. Rear-left
-            new Vector3(-5.5f, 5.5f, 0f),   // 6. Front-left
+            new Vector3(0f, 8.0f, 0f),     // 1. Front
+            new Vector3(6.0f, 6.0f, 0f),   // 2. Front-right
+            new Vector3(6.0f, -6.0f, 0f),  // 3. Rear-right
+            new Vector3(0f, -8.0f, 0f),    // 4. Rear
+            new Vector3(-6.0f, -6.0f, 0f), // 5. Rear-left
+            new Vector3(-6.0f, 6.0f, 0f),  // 6. Front-left
         };
+
+        // Known-working paparazzi camera prop/animation combo.
+        private const string CameraPropModelName = "prop_pap_camera_01";
+        private const string CameraAnimationDictionary = "amb@world_human_paparazzi@male@base";
+        private const string CameraAnimationName = "base";
+        private const int CameraHandBoneId = 28422; // resolved per-ped via GET_PED_BONE_INDEX
+        private const int CameraAnimationHoldMs = 1200;
 
         private readonly Vehicle _vehicle;
         private readonly string _label;
@@ -57,10 +62,14 @@ namespace RealPatrolCallouts.Tasks
 
         private Vector3[] _photoSpots;
         private int _photoIndex;
-        private int _lastRenderedIndex;
+        private int _lastMarkerLogTickCount;
         private bool _isActive;
         private bool _keyWasDown;
         private bool _isPlayerInMarkerRange;
+        private bool _isTakingPhoto;
+
+        private GameFiber _fiber;
+        private Rage.Object _cameraProp;
 
         public bool IsComplete { get; private set; }
 
@@ -86,59 +95,37 @@ namespace RealPatrolCallouts.Tasks
         public void Start()
         {
             _photoIndex = 0;
-            _lastRenderedIndex = -1;
+            _lastMarkerLogTickCount = int.MinValue;
             IsComplete = false;
             _isActive = true;
             _keyWasDown = false;
             _isPlayerInMarkerRange = false;
+            _isTakingPhoto = false;
 
             CalculatePhotoSpots();
 
             Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}] started");
+
+            _fiber = GameFiber.StartNew(RunLoop, $"VehiclePhotoTask:{_label}");
         }
 
+        /// <summary>
+        /// Stops the task's GameFiber and guarantees the camera prop is removed,
+        /// even if this is called mid-animation (e.g. the callout ending early).
+        /// </summary>
         public void Stop()
         {
             _isActive = false;
             _isPlayerInMarkerRange = false;
-        }
 
-        /// <summary>Call once per tick while the task is active.</summary>
-        public void Process()
-        {
-            if (!_isActive || IsComplete)
+            if (_fiber != null && _fiber.IsAlive)
             {
-                _isPlayerInMarkerRange = false;
-                return;
+                _fiber.Abort();
             }
 
-            if (_vehicle == null || !_vehicle.Exists())
-            {
-                Stop();
-                return;
-            }
+            _fiber = null;
 
-            RenderCurrentPhotoMarker();
-            CheckForPhotoTrigger();
-
-            if (!_isPlayerInMarkerRange)
-            {
-                return;
-            }
-
-            Game.DisplayHelp("Press " + _interactionKey + " to take photo");
-
-            bool keyDown = Game.IsKeyDown(_interactionKey);
-            bool keyJustPressed = keyDown && !_keyWasDown;
-            _keyWasDown = keyDown;
-
-            // keyJustPressed is only ever honored here, inside the in-range guard, so a
-            // T press can never register as a photo unless the player is standing in
-            // the active marker.
-            if (keyJustPressed)
-            {
-                TakePhoto();
-            }
+            CleanupCameraProp();
         }
 
         /// <summary>
@@ -165,38 +152,57 @@ namespace RealPatrolCallouts.Tasks
                 _photoSpots[i] = position;
 
                 Game.LogTrivial(
-                    $"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Photo {i + 1} position = " +
-                    $"{position.X:F2}/{position.Y:F2}/{position.Z:F2}");
+                    $"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Photo {i + 1} = " +
+                    $"{position.X:F2} {position.Y:F2} {position.Z:F2}");
             }
-
-            Game.LogTrivial(
-                $"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Calculated {_photoSpots.Length} photo spots using direct offsets.");
         }
 
-        /// <summary>Draws only the marker for the current photo spot. Never more than one at a time.</summary>
-        private void RenderCurrentPhotoMarker()
+        /// <summary>
+        /// Runs on its own GameFiber for the lifetime of the task: redraws the single
+        /// active marker and checks the photo trigger every frame via GameFiber.Yield().
+        /// </summary>
+        private void RunLoop()
+        {
+            while (_isActive && !IsComplete)
+            {
+                if (_vehicle == null || !_vehicle.Exists())
+                {
+                    _isActive = false;
+                    _isPlayerInMarkerRange = false;
+                    break;
+                }
+
+                RenderCurrentPhotoPoint();
+                CheckForPhotoInteraction();
+
+                GameFiber.Yield();
+            }
+        }
+
+        /// <summary>
+        /// Draws the two visuals for the current photo spot: a vertical cylinder marking
+        /// where to stand, and a numbered marker just above it showing which photo is next.
+        /// Never more than one photo spot's markers are drawn at a time.
+        /// </summary>
+        private void RenderCurrentPhotoPoint()
         {
             Vector3 position = _photoSpots[_photoIndex];
 
-            if (_lastRenderedIndex != _photoIndex)
+            int now = Environment.TickCount;
+            if (now - _lastMarkerLogTickCount >= MarkerLogIntervalMs)
             {
-                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Rendering marker {_photoIndex + 1}");
-                _lastRenderedIndex = _photoIndex;
+                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Rendering photo marker {_photoIndex + 1}");
+                _lastMarkerLogTickCount = now;
             }
 
-            int numberedMarkerType = MarkerTypeNumbers[_photoIndex];
+            DrawMarker(MarkerTypeVerticalCylinder, position, CylinderMarkerScale);
 
-            if (!TryDrawMarker(numberedMarkerType, position, NumberedMarkerScale))
-            {
-                Game.LogTrivial(
-                    $"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Numbered marker type {numberedMarkerType} " +
-                    $"failed to render for marker {_photoIndex + 1}; falling back to vertical cylinder");
-
-                TryDrawMarker(MarkerTypeVerticalCylinder, position, CylinderMarkerScale);
-            }
+            Vector3 numberPosition = position;
+            numberPosition.Z += NumberMarkerHeightOffset;
+            DrawMarker(MarkerTypeNumbers[_photoIndex], numberPosition, NumberMarkerScale);
         }
 
-        private bool TryDrawMarker(int nativeMarkerType, Vector3 position, Vector3 scale)
+        private void DrawMarker(int nativeMarkerType, Vector3 position, Vector3 scale)
         {
             try
             {
@@ -212,19 +218,22 @@ namespace RealPatrolCallouts.Tasks
                     2,     // p19
                     true,  // rotate
                     "", "", false);
-                return true;
             }
             catch (Exception ex)
             {
                 Game.LogTrivial(
                     $"RealPatrolCallouts: VehiclePhotoTask [{_label}]: DRAW_MARKER threw for type {nativeMarkerType}: {ex.Message}");
-                return false;
             }
         }
 
-        /// <summary>Only checks the player's distance from the stored current photo spot.</summary>
-        private void CheckForPhotoTrigger()
+        /// <summary>Checks the player's distance from the stored current photo spot and handles the T press.</summary>
+        private void CheckForPhotoInteraction()
         {
+            if (_isTakingPhoto)
+            {
+                return;
+            }
+
             Vector3 currentSpot = _photoSpots[_photoIndex];
             Ped player = Game.LocalPlayer.Character;
             float distance = player.Position.DistanceTo(currentSpot);
@@ -232,21 +241,64 @@ namespace RealPatrolCallouts.Tasks
 
             if (inRange && !_isPlayerInMarkerRange)
             {
-                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Player entered photo trigger {_photoIndex + 1}");
+                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Entered photo point {_photoIndex + 1}");
             }
 
             _isPlayerInMarkerRange = inRange;
+
+            // T must do nothing outside the active trigger radius.
+            if (!inRange)
+            {
+                return;
+            }
+
+            Game.DisplayHelp("Press " + _interactionKey + " to take photo");
+
+            bool keyDown = Game.IsKeyDown(_interactionKey);
+            bool keyJustPressed = keyDown && !_keyWasDown;
+            _keyWasDown = keyDown;
+
+            if (keyJustPressed)
+            {
+                TakePhoto();
+            }
         }
 
+        /// <summary>
+        /// Faces the player toward the vehicle, plays the camera prop + animation, holds it
+        /// long enough to be visible, then advances to the next photo spot. Runs entirely on
+        /// this task's GameFiber, so GameFiber.Sleep here blocks only this task's loop.
+        /// </summary>
         private void TakePhoto()
         {
             int photoNumber = _photoIndex + 1;
+            _isTakingPhoto = true;
+            _isPlayerInMarkerRange = false;
+
+            Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Taking photo {photoNumber}");
+
+            Ped player = Game.LocalPlayer.Character;
+
+            FacePlayerTowardVehicle(player);
+
+            try
+            {
+                CreateAndAttachCameraProp(player);
+                PlayCameraAnimation(player);
+
+                GameFiber.Sleep(CameraAnimationHoldMs);
+
+                PlayPhotoFeedback();
+            }
+            finally
+            {
+                StopCameraAnimation(player);
+                CleanupCameraProp();
+            }
 
             _photoIndex++;
-            _isPlayerInMarkerRange = false;
-            _lastRenderedIndex = -1; // so the next spot's marker logs its own "Rendering marker" line
-
-            PlayPhotoFeedback();
+            _lastMarkerLogTickCount = int.MinValue; // next spot's marker logs its own "Rendering" line immediately
+            _isTakingPhoto = false;
 
             Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Photo {photoNumber} taken");
 
@@ -255,7 +307,79 @@ namespace RealPatrolCallouts.Tasks
                 IsComplete = true;
                 _isActive = false;
 
-                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}] completed");
+                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Vehicle photo task complete");
+            }
+        }
+
+        private void FacePlayerTowardVehicle(Ped player)
+        {
+            Vector3 direction = _vehicle.Position - player.Position;
+            if (direction.X == 0f && direction.Y == 0f)
+            {
+                return;
+            }
+
+            // Matches the forward-vector convention used for road heading elsewhere in this
+            // mod: forward.X = -sin(heading), forward.Y = cos(heading).
+            float headingRadians = (float)Math.Atan2(-direction.X, direction.Y);
+            player.Heading = headingRadians * (180f / (float)Math.PI);
+        }
+
+        private void CreateAndAttachCameraProp(Ped player)
+        {
+            _cameraProp = new Rage.Object(CameraPropModelName, player.Position);
+            Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Camera prop created");
+
+            int boneIndex = NativeFunction.Natives.GET_PED_BONE_INDEX<int>(player, CameraHandBoneId);
+            _cameraProp.AttachTo(player, boneIndex, Vector3.Zero, Vector3.Zero);
+
+            Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Camera prop attached");
+        }
+
+        private static void PlayCameraAnimation(Ped player)
+        {
+            var animationDictionary = new AnimationDictionary(CameraAnimationDictionary);
+            if (!animationDictionary.IsLoaded)
+            {
+                animationDictionary.LoadAndWait();
+            }
+
+            player.Tasks.PlayAnimation(CameraAnimationDictionary, CameraAnimationName, 8.0f, AnimationFlags.None);
+        }
+
+        private static void StopCameraAnimation(Ped player)
+        {
+            try
+            {
+                player.Tasks.ClearImmediately();
+            }
+            catch (Exception)
+            {
+                // Best-effort - the camera prop cleanup right after this matters more
+                // than a clean animation stop.
+            }
+        }
+
+        /// <summary>Detaches and deletes the camera prop. Safe to call repeatedly/redundantly.</summary>
+        private void CleanupCameraProp()
+        {
+            if (_cameraProp == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (_cameraProp.Exists())
+                {
+                    _cameraProp.Detach();
+                    _cameraProp.Delete();
+                }
+            }
+            finally
+            {
+                _cameraProp = null;
+                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Camera prop deleted");
             }
         }
 
