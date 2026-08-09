@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using LSPD_First_Response.Mod.Callouts;
 using Rage;
@@ -25,11 +26,22 @@ namespace RealPatrolCallouts.Callouts
         private const float MinVehicle2Rotation = 10f;
         private const float MaxVehicle2Rotation = 25f;
 
-        private enum ScenePhase
+        /// <summary>
+        /// The patrol workflow this callout drives: arrive -&gt; investigate/interview
+        /// every driver -&gt; photograph the scene -&gt; the player manually runs IDs/writes
+        /// the crash report in PDComp -&gt; distribute the report to each driver and
+        /// dismiss them -&gt; clear/tow whatever's left -&gt; done. Each stage owns the T key
+        /// exclusively; no two stages ever process a T press at the same time.
+        /// </summary>
+        private enum CalloutStage
         {
-            AwaitingArrival,
-            PhotographingScene,
-            PhotographsComplete
+            Responding,
+            InitialInvestigation,
+            Photography,
+            ReportPreparation,
+            ReportDistribution,
+            VehicleClearance,
+            Complete
         }
 
         private Vector3 _calloutPosition;
@@ -38,16 +50,18 @@ namespace RealPatrolCallouts.Callouts
         private Blip _sceneBlip;
         private Vehicle _vehicle1;
         private Vehicle _vehicle2;
-        private Ped _driver1;
-        private Ped _driver2;
+
+        /// <summary>The patrol vehicle the player responded to the call in, captured on acceptance if available.</summary>
+        private Vehicle _responseVehicle;
+
+        private List<AccidentParticipant> _participants;
 
         private ScenePhotoTask _photoTask;
+        private CrashReportConfirmationTask _reportConfirmationTask;
+        private ReportDistributionTask _reportDistributionTask;
+        private DisabledVehicleClearanceTask _vehicleClearanceTask;
 
-        private DriverDialogueTask _dialogueTask1;
-        private DriverDialogueTask _dialogueTask2;
-
-        private ScenePhase _phase;
-        private bool _hasArrived;
+        private CalloutStage _stage;
 
         public override bool OnBeforeCalloutDisplayed()
         {
@@ -70,6 +84,11 @@ namespace RealPatrolCallouts.Callouts
 
             Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision accepted");
 
+            // Best-effort capture of the vehicle the player is responding in. If they
+            // aren't in a vehicle yet (or it can't be resolved), ReportPreparation falls
+            // back to accepting the first police vehicle the player gets into later.
+            _responseVehicle = Game.LocalPlayer.Character.CurrentVehicle;
+
             _sceneBlip = new Blip(_calloutPosition)
             {
                 Color = Color.Red
@@ -77,7 +96,7 @@ namespace RealPatrolCallouts.Callouts
             _sceneBlip.EnableRoute(Color.Yellow);
 
             SpawnScene();
-            _phase = ScenePhase.AwaitingArrival;
+            _stage = CalloutStage.Responding;
 
             Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision scene spawned");
 
@@ -98,48 +117,69 @@ namespace RealPatrolCallouts.Callouts
                 return;
             }
 
-            if (!_hasArrived)
+            switch (_stage)
             {
-                CheckForArrival();
-                return;
-            }
+                case CalloutStage.Responding:
+                    CheckForArrival();
+                    break;
 
-            bool activePhotoMarkerInRange = false;
+                case CalloutStage.InitialInvestigation:
+                    ProcessInitialInvestigation();
+                    break;
 
-            // ScenePhotoTask has no visible markers - it checks the player's distance to
-            // all eight invisible scene photo zones and handles its own T-press interaction
-            // on a dedicated GameFiber, so it no longer needs a per-tick Process() call here -
-            // only its resulting state is read.
-            switch (_phase)
-            {
-                case ScenePhase.PhotographingScene:
-                    activePhotoMarkerInRange = _photoTask.IsPlayerInActiveZoneRange;
+                case CalloutStage.Photography:
                     if (_photoTask.IsComplete)
                     {
                         CompletePhotographs();
                     }
                     break;
-            }
 
-            // Driver dialogue shares the T key with the photo task, so it must stay
-            // silent while the player is standing inside an active photo marker.
-            _dialogueTask1.Process(activePhotoMarkerInRange);
-            _dialogueTask2.Process(activePhotoMarkerInRange);
+                case CalloutStage.ReportPreparation:
+                    _reportConfirmationTask.Process();
+                    if (_reportConfirmationTask.IsComplete)
+                    {
+                        BeginReportDistribution();
+                    }
+                    break;
+
+                case CalloutStage.ReportDistribution:
+                    if (_reportDistributionTask.IsComplete)
+                    {
+                        BeginVehicleClearance();
+                    }
+                    break;
+
+                case CalloutStage.VehicleClearance:
+                    _vehicleClearanceTask.Process();
+                    if (_vehicleClearanceTask.IsComplete)
+                    {
+                        CompleteCallout();
+                    }
+                    break;
+
+                case CalloutStage.Complete:
+                    break;
+            }
         }
 
         public override void End()
         {
             _photoTask?.Stop();
+            _reportDistributionTask?.Stop();
 
             if (_sceneBlip != null && _sceneBlip.Exists())
             {
                 _sceneBlip.Delete();
             }
 
-            DismissPed(_driver1);
-            DismissPed(_driver2);
-            DismissVehicle(_vehicle1);
-            DismissVehicle(_vehicle2);
+            if (_participants != null)
+            {
+                foreach (AccidentParticipant participant in _participants)
+                {
+                    DismissPed(participant.Driver);
+                    DismissVehicle(participant.Vehicle);
+                }
+            }
 
             Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision ended");
 
@@ -190,20 +230,26 @@ namespace RealPatrolCallouts.Callouts
             _vehicle1 = SpawnCollisionVehicle("blista", vehicle1Position, roadHeading, rearEndDamage: true);
             _vehicle2 = SpawnCollisionVehicle("asea", vehicle2Position, roadHeading + rotationOffset, rearEndDamage: false);
 
-            _driver1 = SpawnStandingDriver("a_m_y_business_01", _vehicle1, new Vector3(-2.5f, 0f, 0f));
-            _driver2 = SpawnStandingDriver("a_f_y_business_02", _vehicle2, new Vector3(2.5f, 0f, 0f));
+            Ped driver1 = SpawnStandingDriver("a_m_y_business_01", _vehicle1, new Vector3(-2.5f, 0f, 0f));
+            Ped driver2 = SpawnStandingDriver("a_f_y_business_02", _vehicle2, new Vector3(2.5f, 0f, 0f));
 
             _photoTask = new ScenePhotoTask(new[] { _vehicle1, _vehicle2 }, _sceneHeading, "Accident scene");
 
-            _dialogueTask1 = new DriverDialogueTask(
-                _driver1,
+            var dialogueTask1 = new DriverDialogueTask(
+                driver1,
                 "Can you tell me what happened?",
                 "I was driving through here when the other vehicle hit me. Nobody is hurt.");
 
-            _dialogueTask2 = new DriverDialogueTask(
-                _driver2,
+            var dialogueTask2 = new DriverDialogueTask(
+                driver2,
                 "Can you tell me what happened?",
                 "We collided. I am okay, and I do not think anyone is injured.");
+
+            _participants = new List<AccidentParticipant>
+            {
+                new AccidentParticipant(1, driver1, _vehicle1, dialogueTask1),
+                new AccidentParticipant(2, driver2, _vehicle2, dialogueTask2)
+            };
         }
 
         private static Vehicle SpawnCollisionVehicle(string modelName, Vector3 position, float heading, bool rearEndDamage)
@@ -278,30 +324,157 @@ namespace RealPatrolCallouts.Callouts
                 return;
             }
 
-            _hasArrived = true;
-
             if (_sceneBlip != null && _sceneBlip.Exists())
             {
                 _sceneBlip.IsRouteEnabled = false;
             }
 
-            Game.DisplayHelp("The accident scene needs to be photographed.");
+            Game.DisplayHelp("Check on the involved drivers.");
             Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision player arrived at scene");
 
-            StartScenePhotos();
+            _stage = CalloutStage.InitialInvestigation;
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Initial investigation started");
         }
 
-        private void StartScenePhotos()
+        // ----- Stage 1: initial investigation (injury check, interview, ID collection) -----
+
+        private void ProcessInitialInvestigation()
         {
-            _phase = ScenePhase.PhotographingScene;
+            Ped player = Game.LocalPlayer.Character;
+            AccidentParticipant nearestPending = FindNearestPendingInterview(player.Position);
+
+            foreach (AccidentParticipant participant in _participants)
+            {
+                if (participant.InterviewCompleted)
+                {
+                    continue;
+                }
+
+                // Only the nearest not-yet-interviewed driver owns T this tick, so two
+                // drivers standing close together can never both react to one press.
+                bool suppress = participant != nearestPending;
+                participant.InterviewTask.Process(suppress);
+
+                if (participant.InterviewTask.IsComplete)
+                {
+                    CompleteInterview(participant);
+                }
+            }
+
+            if (AllInterviewsComplete())
+            {
+                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: All participants interviewed");
+                BeginPhotography();
+            }
+        }
+
+        private AccidentParticipant FindNearestPendingInterview(Vector3 playerPosition)
+        {
+            AccidentParticipant nearest = null;
+            float nearestDistance = float.MaxValue;
+
+            foreach (AccidentParticipant participant in _participants)
+            {
+                if (participant.InterviewCompleted)
+                {
+                    continue;
+                }
+
+                if (participant.Driver == null || !participant.Driver.Exists())
+                {
+                    continue;
+                }
+
+                float distance = playerPosition.DistanceTo(participant.Driver.Position);
+                if (distance < nearestDistance)
+                {
+                    nearestDistance = distance;
+                    nearest = participant;
+                }
+            }
+
+            return nearest;
+        }
+
+        private void CompleteInterview(AccidentParticipant participant)
+        {
+            participant.InterviewCompleted = true;
+            participant.IdCollected = true;
+            participant.DisplayName = PersonaHelper.GetDisplayName(participant.Driver);
+
+            string dob = PersonaHelper.GetDateOfBirthText(participant.Driver);
+            string idMessage = "ID Collected: " + participant.DisplayName;
+            if (!string.IsNullOrEmpty(dob))
+            {
+                idMessage += " (DOB " + dob + ")";
+            }
+
+            Game.DisplayNotification("~b~" + idMessage);
+            Game.LogTrivial($"RealPatrolCallouts: MinorTrafficCollision: Driver {participant.Number} interview complete / ID collected");
+        }
+
+        private bool AllInterviewsComplete()
+        {
+            foreach (AccidentParticipant participant in _participants)
+            {
+                if (!participant.InterviewCompleted || !participant.IdCollected)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // ----- Stage 2: scene photography (existing 8-photo ScenePhotoTask, unchanged) -----
+
+        private void BeginPhotography()
+        {
+            _stage = CalloutStage.Photography;
             _photoTask.Start();
+
+            Game.DisplayHelp("Document the accident scene.");
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Photography started");
         }
 
         private void CompletePhotographs()
         {
-            _phase = ScenePhase.PhotographsComplete;
+            _stage = CalloutStage.ReportPreparation;
 
-            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision scene photographs complete");
+            Game.DisplayNotification("~b~Return to your patrol vehicle to complete your checks and crash report.");
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Photography complete");
+
+            _reportConfirmationTask = new CrashReportConfirmationTask(_responseVehicle);
+        }
+
+        // ----- Stage 3/4: report preparation (manual MDT/PDComp) and distribution -----
+
+        private void BeginReportDistribution()
+        {
+            _stage = CalloutStage.ReportDistribution;
+
+            _reportDistributionTask = new ReportDistributionTask(_participants);
+            _reportDistributionTask.Start();
+        }
+
+        // ----- Stage 5: vehicle clearance/tow -----
+
+        private void BeginVehicleClearance()
+        {
+            _stage = CalloutStage.VehicleClearance;
+
+            _vehicleClearanceTask = new DisabledVehicleClearanceTask(_reportDistributionTask.DisabledVehicles, _calloutPosition);
+        }
+
+        private void CompleteCallout()
+        {
+            _stage = CalloutStage.Complete;
+
+            Game.DisplayNotification("~b~Accident scene clear.");
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Scene clear");
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: Callout complete");
+
+            End();
         }
 
         private static void DismissPed(Ped ped)
