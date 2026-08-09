@@ -177,7 +177,6 @@ namespace RealPatrolCallouts.Callouts
                 IsPersistent = true
             };
 
-            vehicle.PlaceOnGroundProperly();
             vehicle.IsPositionFrozen = true;
 
             // Moderate engine health + a local dent keep damage visible without fire/explosions.
@@ -194,13 +193,18 @@ namespace RealPatrolCallouts.Callouts
         {
             Vector3 pedPosition = vehicle.GetOffsetPosition(localOffset);
 
+            float? groundZ = World.GetGroundZ(pedPosition, false, true);
+            if (groundZ.HasValue)
+            {
+                pedPosition.Z = groundZ.Value;
+            }
+
             var driver = new Ped(modelName, pedPosition, vehicle.Heading)
             {
                 IsPersistent = true,
                 BlockPermanentEvents = true
             };
 
-            driver.PlaceOnGroundProperly();
             driver.Tasks.StandStill(-1);
 
             return driver;
