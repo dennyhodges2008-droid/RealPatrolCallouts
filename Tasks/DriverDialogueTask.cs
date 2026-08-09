@@ -5,9 +5,12 @@ using Rage;
 namespace RealPatrolCallouts.Tasks
 {
     /// <summary>
-    /// Minimal two-line subtitle "conversation" with a driver ped: an officer prompt
-    /// followed by the driver's fixed response. No branching, no fault-finding - just
-    /// scripted flavor text triggered by proximity + a key press.
+    /// Functional driver interview: a short sequence of officer/driver subtitle
+    /// "conversation" exchanges covering an injury check, the driver's account of what
+    /// happened, and a driver's license/ID request - triggered by proximity + a key press.
+    /// The account exchange is still the same scripted flavor text passed in by the
+    /// caller (its content will be revisited separately); the injury-check and ID-request
+    /// exchanges are the functional steps every interview needs regardless of content.
     /// </summary>
     public class DriverDialogueTask
     {
@@ -15,30 +18,51 @@ namespace RealPatrolCallouts.Tasks
         private const int LineDurationMs = 4500;
 
         private readonly Ped _driver;
-        private readonly string _officerLine;
-        private readonly string _driverLine;
+        private readonly string[] _officerLines;
+        private readonly string[] _driverLines;
         private readonly Keys _interactionKey;
 
         private bool _keyWasDown;
         private bool _isTalking;
-        private bool _isOnSecondLine;
+        private bool _isOnDriverLine;
+        private int _exchangeIndex;
         private DateTime _currentLineStartedAt;
 
-        public DriverDialogueTask(Ped driver, string officerLine, string driverLine, Keys interactionKey = Keys.T)
+        public DriverDialogueTask(Ped driver, string accountQuestion, string accountAnswer, Keys interactionKey = Keys.T)
         {
             _driver = driver;
-            _officerLine = officerLine;
-            _driverLine = driverLine;
             _interactionKey = interactionKey;
+
+            _officerLines = new[]
+            {
+                "Is anyone injured, or do you need medical attention?",
+                accountQuestion,
+                "Can I see your driver's license, please?"
+            };
+
+            _driverLines = new[]
+            {
+                "No, I'm okay. I don't think anyone's hurt.",
+                accountAnswer,
+                "Sure, here you go."
+            };
         }
+
+        /// <summary>True once all interview exchanges (injury check, account, ID request) have played out.</summary>
+        public bool IsComplete { get; private set; }
 
         /// <summary>
         /// Call once per tick. <paramref name="suppressInteraction"/> should be true whenever
-        /// the player is within range of an active ScenePhotoTask photo zone, so the
-        /// shared T key can never trigger both a photo and a line of dialogue on the same press.
+        /// another interaction (another driver's interview, the photo task, etc.) currently
+        /// owns the shared T key, so two interactions can never react to the same press.
         /// </summary>
         public void Process(bool suppressInteraction)
         {
+            if (IsComplete)
+            {
+                return;
+            }
+
             if (_driver == null || !_driver.Exists())
             {
                 return;
@@ -75,19 +99,22 @@ namespace RealPatrolCallouts.Tasks
 
             if (keyJustPressed)
             {
-                StartDialogue();
+                StartExchange();
             }
         }
 
-        private void StartDialogue()
+        private void StartExchange()
         {
             _isTalking = true;
-            _isOnSecondLine = false;
+            _isOnDriverLine = false;
             _currentLineStartedAt = DateTime.Now;
 
-            Game.DisplaySubtitle("Officer: \"" + _officerLine + "\"", LineDurationMs);
+            Game.DisplaySubtitle("Officer: \"" + _officerLines[_exchangeIndex] + "\"", LineDurationMs);
 
-            Game.LogTrivial("RealPatrolCallouts: DriverDialogueTask started");
+            if (_exchangeIndex == 0)
+            {
+                Game.LogTrivial("RealPatrolCallouts: DriverDialogueTask started");
+            }
         }
 
         private void AdvanceDialogue()
@@ -99,16 +126,28 @@ namespace RealPatrolCallouts.Tasks
                 return;
             }
 
-            if (!_isOnSecondLine)
+            if (!_isOnDriverLine)
             {
-                _isOnSecondLine = true;
+                _isOnDriverLine = true;
                 _currentLineStartedAt = DateTime.Now;
 
-                Game.DisplaySubtitle("Driver: \"" + _driverLine + "\"", LineDurationMs);
+                Game.DisplaySubtitle("Driver: \"" + _driverLines[_exchangeIndex] + "\"", LineDurationMs);
+                return;
+            }
+
+            _exchangeIndex++;
+
+            if (_exchangeIndex < _officerLines.Length)
+            {
+                _isOnDriverLine = false;
+                _currentLineStartedAt = DateTime.Now;
+
+                Game.DisplaySubtitle("Officer: \"" + _officerLines[_exchangeIndex] + "\"", LineDurationMs);
                 return;
             }
 
             _isTalking = false;
+            IsComplete = true;
 
             Game.LogTrivial("RealPatrolCallouts: DriverDialogueTask completed");
         }
