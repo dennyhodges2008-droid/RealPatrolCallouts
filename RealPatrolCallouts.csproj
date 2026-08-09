@@ -56,7 +56,7 @@
     <Compile Include="Main.cs" />
     <Compile Include="Callouts\TestCallout.cs" />
     <Compile Include="Callouts\MinorTrafficCollision.cs" />
-    <Compile Include="Tasks\VehiclePhotoTask.cs" />
+    <Compile Include="Tasks\ScenePhotoTask.cs" />
     <Compile Include="Tasks\DriverDialogueTask.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
