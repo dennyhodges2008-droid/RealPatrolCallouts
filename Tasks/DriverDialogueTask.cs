@@ -34,8 +34,8 @@ namespace RealPatrolCallouts.Tasks
 
         /// <summary>
         /// Call once per tick. <paramref name="suppressInteraction"/> should be true whenever
-        /// the player is standing inside an active VehiclePhotoTask marker, so the shared T
-        /// key can never trigger both a photo and a line of dialogue on the same press.
+        /// the player is within range of an active VehiclePhotoTask photo position, so the
+        /// shared T key can never trigger both a photo and a line of dialogue on the same press.
         /// </summary>
         public void Process(bool suppressInteraction)
         {

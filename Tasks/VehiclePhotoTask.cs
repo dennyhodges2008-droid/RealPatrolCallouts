@@ -10,43 +10,25 @@ namespace RealPatrolCallouts.Tasks
     /// Reusable six-position "walk around the vehicle and photograph it" task.
     /// Photo spots are calculated once (relative to the target vehicle's own
     /// position/heading) when the task starts, not recalculated every frame.
-    /// A dedicated GameFiber redraws the single active marker and checks for
-    /// the photo trigger every frame while the task is active.
+    /// There are no visible markers - all six positions are invisible triggers
+    /// that are simultaneously active, and can be photographed in any order.
+    /// A dedicated GameFiber checks the player's distance to every uncompleted
+    /// position and handles the photo trigger every frame while the task is active.
     /// </summary>
     public class VehiclePhotoTask
     {
         private const float TriggerRadius = 1.5f;
 
-        // GTA native DRAW_MARKER type IDs: 1 = vertical cylinder (shows WHERE to
-        // stand), 11-16 = numbered markers 1-6 (shows WHICH photo is next). Both
-        // are drawn at the same location for the single active photo spot.
-        private const int MarkerTypeVerticalCylinder = 1;
-
-        private static readonly int[] MarkerTypeNumbers = { 11, 12, 13, 14, 15, 16 };
-
-        private static readonly Vector3 CylinderMarkerScale = new Vector3(1.5f, 1.5f, 0.35f);
-        private static readonly Vector3 NumberMarkerScale = new Vector3(1.0f, 1.0f, 1.0f);
-        private const float NumberMarkerHeightOffset = 0.4f;
-
-        private const int MarkerColorR = 0;
-        private const int MarkerColorG = 120;
-        private const int MarkerColorB = 255;
-        private const int MarkerAlpha = 180;
-
-        // Throttle for the "Rendering photo marker X" log line - DRAW_MARKER itself
-        // still runs every frame, only the log call is rate-limited.
-        private const int MarkerLogIntervalMs = 3000;
-
         // Offsets are relative to the vehicle's own position/heading via
         // GetOffsetPosition, then snapped to ground level (see CalculatePhotoSpots).
         private static readonly Vector3[] LocalPhotoOffsets =
         {
-            new Vector3(0f, 8.0f, 0f),     // 1. Front
-            new Vector3(6.0f, 6.0f, 0f),   // 2. Front-right
-            new Vector3(6.0f, -6.0f, 0f),  // 3. Rear-right
-            new Vector3(0f, -8.0f, 0f),    // 4. Rear
-            new Vector3(-6.0f, -6.0f, 0f), // 5. Rear-left
-            new Vector3(-6.0f, 6.0f, 0f),  // 6. Front-left
+            new Vector3(0f, 5.5f, 0f),      // 1. Front
+            new Vector3(4.25f, 4.25f, 0f),  // 2. Front-right
+            new Vector3(4.25f, -4.25f, 0f), // 3. Rear-right
+            new Vector3(0f, -5.5f, 0f),     // 4. Rear
+            new Vector3(-4.25f, -4.25f, 0f),// 5. Rear-left
+            new Vector3(-4.25f, 4.25f, 0f), // 6. Front-left
         };
 
         // Known-working paparazzi camera prop/animation combo.
@@ -61,8 +43,8 @@ namespace RealPatrolCallouts.Tasks
         private readonly Keys _interactionKey;
 
         private Vector3[] _photoSpots;
-        private int _photoIndex;
-        private int _lastMarkerLogTickCount;
+        private bool[] _completed;
+        private int _completedCount;
         private bool _isActive;
         private bool _keyWasDown;
         private bool _isPlayerInMarkerRange;
@@ -75,12 +57,12 @@ namespace RealPatrolCallouts.Tasks
 
         public int TotalPhotos => _photoSpots?.Length ?? 0;
 
-        public int CompletedPhotos => _photoIndex;
+        public int CompletedPhotos => _completedCount;
 
-        /// <summary>The six calculated world-space photo positions, in order.</summary>
+        /// <summary>The six calculated world-space photo positions (invisible triggers).</summary>
         public IReadOnlyList<Vector3> PhotoSpots => _photoSpots;
 
-        /// <summary>True only while the player is standing inside the currently active marker.</summary>
+        /// <summary>True only while the player is standing within range of the nearest uncompleted position.</summary>
         public bool IsPlayerInActiveMarkerRange => _isPlayerInMarkerRange;
 
         // interactionKey is a constructor parameter (not hard-coded internally) so a
@@ -94,8 +76,7 @@ namespace RealPatrolCallouts.Tasks
 
         public void Start()
         {
-            _photoIndex = 0;
-            _lastMarkerLogTickCount = int.MinValue;
+            _completedCount = 0;
             IsComplete = false;
             _isActive = true;
             _keyWasDown = false;
@@ -103,8 +84,10 @@ namespace RealPatrolCallouts.Tasks
             _isTakingPhoto = false;
 
             CalculatePhotoSpots();
+            _completed = new bool[_photoSpots.Length];
 
             Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}] started");
+            Game.DisplayNotification($"~b~{_label} photographs: {_completedCount}/{TotalPhotos}");
 
             _fiber = GameFiber.StartNew(RunLoop, $"VehiclePhotoTask:{_label}");
         }
@@ -142,7 +125,7 @@ namespace RealPatrolCallouts.Tasks
                 Vector3 position = _vehicle.GetOffsetPosition(LocalPhotoOffsets[i]);
 
                 // The vehicle's own Z can sit above true ground level, which would make
-                // the marker float instead of reading as a normal ground checkpoint.
+                // the trigger position float instead of sitting at normal ground level.
                 float? groundZ = World.GetGroundZ(position, false, true);
                 if (groundZ.HasValue)
                 {
@@ -152,14 +135,14 @@ namespace RealPatrolCallouts.Tasks
                 _photoSpots[i] = position;
 
                 Game.LogTrivial(
-                    $"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Photo {i + 1} = " +
+                    $"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Photo position {i + 1} = " +
                     $"{position.X:F2} {position.Y:F2} {position.Z:F2}");
             }
         }
 
         /// <summary>
-        /// Runs on its own GameFiber for the lifetime of the task: redraws the single
-        /// active marker and checks the photo trigger every frame via GameFiber.Yield().
+        /// Runs on its own GameFiber for the lifetime of the task: checks the photo
+        /// trigger every frame via GameFiber.Yield(). No markers are ever drawn.
         /// </summary>
         private void RunLoop()
         {
@@ -172,7 +155,6 @@ namespace RealPatrolCallouts.Tasks
                     break;
                 }
 
-                RenderCurrentPhotoPoint();
                 CheckForPhotoInteraction();
 
                 GameFiber.Yield();
@@ -180,53 +162,34 @@ namespace RealPatrolCallouts.Tasks
         }
 
         /// <summary>
-        /// Draws the two visuals for the current photo spot: a vertical cylinder marking
-        /// where to stand, and a numbered marker just above it showing which photo is next.
-        /// Never more than one photo spot's markers are drawn at a time.
+        /// Finds the nearest uncompleted photo position to the player. All six positions
+        /// are active at once, so the player can approach them in any order; if the
+        /// player is within range of more than one, the nearest uncompleted one wins.
         /// </summary>
-        private void RenderCurrentPhotoPoint()
+        private bool TryGetNearestUncompletedPosition(Vector3 playerPosition, out int nearestIndex, out float nearestDistance)
         {
-            Vector3 position = _photoSpots[_photoIndex];
+            nearestIndex = -1;
+            nearestDistance = float.MaxValue;
 
-            int now = Environment.TickCount;
-            if (now - _lastMarkerLogTickCount >= MarkerLogIntervalMs)
+            for (int i = 0; i < _photoSpots.Length; i++)
             {
-                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Rendering photo marker {_photoIndex + 1}");
-                _lastMarkerLogTickCount = now;
+                if (_completed[i])
+                {
+                    continue;
+                }
+
+                float distance = playerPosition.DistanceTo(_photoSpots[i]);
+                if (distance < nearestDistance)
+                {
+                    nearestDistance = distance;
+                    nearestIndex = i;
+                }
             }
 
-            DrawMarker(MarkerTypeVerticalCylinder, position, CylinderMarkerScale);
-
-            Vector3 numberPosition = position;
-            numberPosition.Z += NumberMarkerHeightOffset;
-            DrawMarker(MarkerTypeNumbers[_photoIndex], numberPosition, NumberMarkerScale);
+            return nearestIndex >= 0;
         }
 
-        private void DrawMarker(int nativeMarkerType, Vector3 position, Vector3 scale)
-        {
-            try
-            {
-                NativeFunction.Natives.DRAW_MARKER(
-                    nativeMarkerType,
-                    position.X, position.Y, position.Z,
-                    0f, 0f, 0f,
-                    0f, 0f, 0f,
-                    scale.X, scale.Y, scale.Z,
-                    MarkerColorR, MarkerColorG, MarkerColorB, MarkerAlpha,
-                    true,  // bobUpAndDown
-                    false, // faceCamera
-                    2,     // p19
-                    true,  // rotate
-                    "", "", false);
-            }
-            catch (Exception ex)
-            {
-                Game.LogTrivial(
-                    $"RealPatrolCallouts: VehiclePhotoTask [{_label}]: DRAW_MARKER threw for type {nativeMarkerType}: {ex.Message}");
-            }
-        }
-
-        /// <summary>Checks the player's distance from the stored current photo spot and handles the T press.</summary>
+        /// <summary>Checks the player's distance from the nearest uncompleted photo position and handles the T press.</summary>
         private void CheckForPhotoInteraction()
         {
             if (_isTakingPhoto)
@@ -234,19 +197,19 @@ namespace RealPatrolCallouts.Tasks
                 return;
             }
 
-            Vector3 currentSpot = _photoSpots[_photoIndex];
             Ped player = Game.LocalPlayer.Character;
-            float distance = player.Position.DistanceTo(currentSpot);
-            bool inRange = distance <= TriggerRadius;
+
+            bool hasUncompleted = TryGetNearestUncompletedPosition(player.Position, out int nearestIndex, out float nearestDistance);
+            bool inRange = hasUncompleted && nearestDistance <= TriggerRadius;
 
             if (inRange && !_isPlayerInMarkerRange)
             {
-                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Entered photo point {_photoIndex + 1}");
+                Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Entered photo point {nearestIndex + 1}");
             }
 
             _isPlayerInMarkerRange = inRange;
 
-            // T must do nothing outside the active trigger radius.
+            // T must do nothing outside an active trigger radius.
             if (!inRange)
             {
                 return;
@@ -260,18 +223,18 @@ namespace RealPatrolCallouts.Tasks
 
             if (keyJustPressed)
             {
-                TakePhoto();
+                TakePhoto(nearestIndex);
             }
         }
 
         /// <summary>
         /// Faces the player toward the vehicle, plays the camera prop + animation, holds it
-        /// long enough to be visible, then advances to the next photo spot. Runs entirely on
-        /// this task's GameFiber, so GameFiber.Sleep here blocks only this task's loop.
+        /// long enough to be visible, then marks the given position completed. Runs entirely
+        /// on this task's GameFiber, so GameFiber.Sleep here blocks only this task's loop.
         /// </summary>
-        private void TakePhoto()
+        private void TakePhoto(int photoSpotIndex)
         {
-            int photoNumber = _photoIndex + 1;
+            int photoNumber = photoSpotIndex + 1;
             _isTakingPhoto = true;
             _isPlayerInMarkerRange = false;
 
@@ -296,17 +259,20 @@ namespace RealPatrolCallouts.Tasks
                 CleanupCameraProp();
             }
 
-            _photoIndex++;
-            _lastMarkerLogTickCount = int.MinValue; // next spot's marker logs its own "Rendering" line immediately
+            // Positions cannot be counted again once completed.
+            _completed[photoSpotIndex] = true;
+            _completedCount++;
             _isTakingPhoto = false;
 
             Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Photo {photoNumber} taken");
+            Game.DisplayNotification($"~b~{_label} photographs: {_completedCount}/{TotalPhotos}");
 
-            if (_photoIndex >= _photoSpots.Length)
+            if (_completedCount >= _photoSpots.Length)
             {
                 IsComplete = true;
                 _isActive = false;
 
+                Game.DisplayNotification($"~b~{_label} photographs complete.");
                 Game.LogTrivial($"RealPatrolCallouts: VehiclePhotoTask [{_label}]: Vehicle photo task complete");
             }
         }
@@ -385,8 +351,6 @@ namespace RealPatrolCallouts.Tasks
 
         private static void PlayPhotoFeedback()
         {
-            Game.DisplayNotification("~b~Photo captured.");
-
             try
             {
                 NativeFunction.Natives.PLAY_SOUND_FRONTEND(-1, "Camera_Shutter", "Phone_Soundset_Michael", false);
