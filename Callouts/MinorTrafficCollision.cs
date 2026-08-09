@@ -16,6 +16,15 @@ namespace RealPatrolCallouts.Callouts
         private const float SceneBlipRadius = 30f;
         private const float ArrivalDistance = 25f;
 
+        // Approximate half-lengths (nose-to-tail / 2) for the two spawned models, used to
+        // keep the vehicles bumper-to-bumper without intersecting geometry.
+        private const float Vehicle1HalfLength = 2.0f; // Blista compact hatchback (~4.0m long)
+        private const float Vehicle2HalfLength = 2.3f; // Asea mid-size sedan (~4.6m long)
+        private const float MinImpactGap = 0.5f;
+        private const float MaxImpactGap = 1.5f;
+        private const float MinVehicle2Rotation = 10f;
+        private const float MaxVehicle2Rotation = 25f;
+
         private enum ScenePhase
         {
             AwaitingArrival,
@@ -34,6 +43,9 @@ namespace RealPatrolCallouts.Callouts
 
         private VehiclePhotoTask _photoTask1;
         private VehiclePhotoTask _photoTask2;
+
+        private DriverDialogueTask _dialogueTask1;
+        private DriverDialogueTask _dialogueTask2;
 
         private ScenePhase _phase;
         private bool _hasArrived;
@@ -93,10 +105,13 @@ namespace RealPatrolCallouts.Callouts
                 return;
             }
 
+            bool activePhotoMarkerInRange = false;
+
             switch (_phase)
             {
                 case ScenePhase.PhotographingVehicle1:
                     _photoTask1.Process();
+                    activePhotoMarkerInRange = _photoTask1.IsPlayerInActiveMarkerRange;
                     if (_photoTask1.IsComplete)
                     {
                         StartVehicle2Photos();
@@ -105,12 +120,18 @@ namespace RealPatrolCallouts.Callouts
 
                 case ScenePhase.PhotographingVehicle2:
                     _photoTask2.Process();
+                    activePhotoMarkerInRange = _photoTask2.IsPlayerInActiveMarkerRange;
                     if (_photoTask2.IsComplete)
                     {
                         CompletePhotographs();
                     }
                     break;
             }
+
+            // Driver dialogue shares the T key with the photo task, so it must stay
+            // silent while the player is standing inside an active photo marker.
+            _dialogueTask1.Process(activePhotoMarkerInRange);
+            _dialogueTask2.Process(activePhotoMarkerInRange);
         }
 
         public override void End()
@@ -155,19 +176,42 @@ namespace RealPatrolCallouts.Callouts
             float headingRadians = roadHeading * (float)(Math.PI / 180.0);
 
             Vector3 forward = new Vector3(-(float)Math.Sin(headingRadians), (float)Math.Cos(headingRadians), 0f);
-            Vector3 right = new Vector3((float)Math.Cos(headingRadians), (float)Math.Sin(headingRadians), 0f);
 
-            Vector3 vehicle1Position = _calloutPosition + forward * 1.5f;
-            Vector3 vehicle2Position = _calloutPosition - forward * 1.7f + right * 0.4f;
+            var rng = new Random();
+            float impactGap = MinImpactGap + (float)(rng.NextDouble() * (MaxImpactGap - MinImpactGap));
+            float rotationOffset = MinVehicle2Rotation + (float)(rng.NextDouble() * (MaxVehicle2Rotation - MinVehicle2Rotation));
+            if (rng.Next(2) == 0)
+            {
+                rotationOffset = -rotationOffset;
+            }
+
+            // Vehicle 1 sits on the road heading; Vehicle 2 rear-ended it, so it comes to
+            // rest just behind it, angled slightly off-heading rather than perfectly
+            // nose-to-tail. Centers are spaced by both half-lengths plus the impact gap so
+            // the bodies never intersect.
+            float centerDistance = Vehicle1HalfLength + impactGap + Vehicle2HalfLength;
+
+            Vector3 vehicle1Position = _calloutPosition;
+            Vector3 vehicle2Position = _calloutPosition - forward * centerDistance;
 
             _vehicle1 = SpawnCollisionVehicle("blista", vehicle1Position, roadHeading, rearEndDamage: true);
-            _vehicle2 = SpawnCollisionVehicle("asea", vehicle2Position, roadHeading + 7f, rearEndDamage: false);
+            _vehicle2 = SpawnCollisionVehicle("asea", vehicle2Position, roadHeading + rotationOffset, rearEndDamage: false);
 
             _driver1 = SpawnStandingDriver("a_m_y_business_01", _vehicle1, new Vector3(-2.5f, 0f, 0f));
             _driver2 = SpawnStandingDriver("a_f_y_business_02", _vehicle2, new Vector3(2.5f, 0f, 0f));
 
             _photoTask1 = new VehiclePhotoTask(_vehicle1, "Vehicle 1");
             _photoTask2 = new VehiclePhotoTask(_vehicle2, "Vehicle 2");
+
+            _dialogueTask1 = new DriverDialogueTask(
+                _driver1,
+                "Can you tell me what happened?",
+                "I was driving through here when the other vehicle hit me. Nobody is hurt.");
+
+            _dialogueTask2 = new DriverDialogueTask(
+                _driver2,
+                "Can you tell me what happened?",
+                "We collided. I am okay, and I do not think anyone is injured.");
         }
 
         private static Vehicle SpawnCollisionVehicle(string modelName, Vector3 position, float heading, bool rearEndDamage)
