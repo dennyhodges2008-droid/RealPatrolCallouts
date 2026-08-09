@@ -32,6 +32,9 @@ namespace RealPatrolCallouts.Tasks
         {
             _driver = driver;
             _interactionKey = interactionKey;
+            // Seed from the live key state rather than assuming it's up, so T can't cascade
+            // in from whatever was held right before this driver's interview started owning it.
+            _keyWasDown = Game.IsKeyDown(interactionKey);
 
             _officerLines = new[]
             {

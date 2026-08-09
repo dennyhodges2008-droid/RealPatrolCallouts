@@ -130,7 +130,10 @@ namespace RealPatrolCallouts.Tasks
             _completedCount = 0;
             IsComplete = false;
             _isActive = true;
-            _keyWasDown = false;
+            // Seed from the live key state rather than assuming it's up - T may still be
+            // held from the press that completed the previous stage's interaction, and this
+            // task must not treat that carry-over as a fresh press.
+            _keyWasDown = Game.IsKeyDown(_interactionKey);
             _isPlayerInZoneRange = false;
             _isTakingPhoto = false;
 

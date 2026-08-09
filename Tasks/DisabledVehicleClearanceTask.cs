@@ -39,6 +39,10 @@ namespace RealPatrolCallouts.Tasks
             }
 
             _cleared = new bool[_vehicles.Count];
+
+            // Seed from the live key state rather than assuming it's up - T may still be
+            // held from the dismissal press that ended the previous stage.
+            _keyWasDown = Game.IsKeyDown(_interactionKey);
         }
 
         public bool IsComplete
