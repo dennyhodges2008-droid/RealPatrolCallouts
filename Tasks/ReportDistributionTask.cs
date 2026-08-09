@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Windows.Forms;
 using Rage;
 using Rage.Native;
@@ -24,18 +25,14 @@ namespace RealPatrolCallouts.Tasks
         private const string PaperPropModel = "prop_notepad_01";
         private const int HandBoneId = 28422; // same right-hand bone id ScenePhotoTask uses for the camera prop
         private const float DepartureSpeed = 15.0f;
-        private const int DepartureTimeoutTicks = 900; // ~15s of GameFiber.Yield() ticks
-
-        private class PendingDeparture
-        {
-            public Ped Driver;
-            public Vehicle Vehicle;
-            public int WaitTicks;
-        }
+        private const int NormalDrivingStyle = 786603; // "Normal" - obeys traffic laws, no reckless/rushed behavior
+        private const int DriverDoorIndex = 0;
+        private const int VehicleEntryTimeoutMs = 15000;
+        private const int DoorCloseDelayMs = 650; // lets the normal get-in animation close the door before the fallback fires
 
         private readonly List<AccidentParticipant> _participants;
         private readonly List<Vehicle> _disabledVehicles = new List<Vehicle>();
-        private readonly List<PendingDeparture> _pendingDepartures = new List<PendingDeparture>();
+        private readonly List<GameFiber> _departureFibers = new List<GameFiber>();
         private readonly Keys _interactionKey;
 
         private bool _isActive;
@@ -91,6 +88,16 @@ namespace RealPatrolCallouts.Tasks
 
             _fiber = null;
 
+            foreach (GameFiber departureFiber in _departureFibers)
+            {
+                if (departureFiber != null && departureFiber.IsAlive)
+                {
+                    departureFiber.Abort();
+                }
+            }
+
+            _departureFibers.Clear();
+
             CleanupPaperProp();
         }
 
@@ -99,7 +106,6 @@ namespace RealPatrolCallouts.Tasks
             while (_isActive && !IsComplete)
             {
                 CheckForInteraction();
-                ProcessPendingDepartures();
 
                 GameFiber.Yield();
             }
@@ -254,9 +260,14 @@ namespace RealPatrolCallouts.Tasks
                 {
                     vehicle.IsPositionFrozen = false;
 
-                    // seat -1 = driver seat; flag 1 = normal (non-warp) vehicle entry.
-                    NativeFunction.Natives.TASK_ENTER_VEHICLE(driver, vehicle, -1, -1, 1.0f, 1, 0);
-                    _pendingDepartures.Add(new PendingDeparture { Driver = driver, Vehicle = vehicle });
+                    // Runs on its own GameFiber, independent of this task's RunLoop - that loop's
+                    // IsComplete flips true the instant the last driver is marked Dismissed, which
+                    // used to cut a still-entering driver's departure short. A dedicated fiber per
+                    // participant can't be raced like that, and it's identical for every driver.
+                    GameFiber departureFiber = GameFiber.StartNew(
+                        () => DepartInVehicle(participant),
+                        "AccidentDeparture_Driver" + participant.Number);
+                    _departureFibers.Add(departureFiber);
                 }
                 else
                 {
@@ -274,42 +285,92 @@ namespace RealPatrolCallouts.Tasks
         }
 
         /// <summary>
-        /// Waits for a dismissed driver to finish getting into their vehicle before sending
-        /// them off, so they never visibly warp in. Runs on the task's own GameFiber loop
-        /// rather than a per-driver fiber, since that loop already ticks every frame.
+        /// Common departure routine used identically for every driveable participant: enter
+        /// the vehicle, wait until actually seated, let/force the door shut, start the engine,
+        /// then hand off to the normal civilian driving task. Never called for a participant
+        /// whose vehicle was rolled disabled - those drivers leave on foot via DismissDriver
+        /// and the vehicle is left for towing.
         /// </summary>
-        private void ProcessPendingDepartures()
+        private void DepartInVehicle(AccidentParticipant participant)
         {
-            for (int i = _pendingDepartures.Count - 1; i >= 0; i--)
+            Ped driver = participant.Driver;
+            Vehicle vehicle = participant.Vehicle;
+            string label = "Driver " + participant.Number;
+
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: " + label + ": starting vehicle departure");
+
+            if (driver == null || !driver.Exists() || vehicle == null || !vehicle.Exists())
             {
-                PendingDeparture pending = _pendingDepartures[i];
-
-                if (pending.Driver == null || !pending.Driver.Exists()
-                    || pending.Vehicle == null || !pending.Vehicle.Exists())
-                {
-                    _pendingDepartures.RemoveAt(i);
-                    continue;
-                }
-
-                if (pending.Driver.CurrentVehicle == pending.Vehicle)
-                {
-                    // 786603 is the standard "Normal" driving style used throughout GTA V
-                    // scripting - obeys traffic laws, no reckless/rushed behavior.
-                    NativeFunction.Natives.TASK_VEHICLE_DRIVE_WANDER(pending.Driver, pending.Vehicle, DepartureSpeed, 786603);
-                    _pendingDepartures.RemoveAt(i);
-                    continue;
-                }
-
-                pending.WaitTicks++;
-                if (pending.WaitTicks > DepartureTimeoutTicks)
-                {
-                    // Driver never finished entering the vehicle - leave them be rather than
-                    // retrying indefinitely; the vehicle stays behind and is treated as one
-                    // that still needs to be cleared/towed.
-                    _disabledVehicles.Add(pending.Vehicle);
-                    _pendingDepartures.RemoveAt(i);
-                }
+                return;
             }
+
+            // seat -1 = driver seat; flag 1 = normal (non-warp) vehicle entry.
+            NativeFunction.Natives.TASK_ENTER_VEHICLE(driver, vehicle, -1, -1, 1.0f, 1, 0);
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: " + label + ": entering vehicle");
+
+            if (!WaitUntilSeated(driver, vehicle, VehicleEntryTimeoutMs))
+            {
+                Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: " + label + ": vehicle entry timed out");
+                if (vehicle.Exists())
+                {
+                    _disabledVehicles.Add(vehicle);
+                }
+
+                return;
+            }
+
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: " + label + ": seated in vehicle");
+
+            // Let GTA's own get-in animation close the door naturally before falling back to
+            // forcing it shut - SET_VEHICLE_DOOR_SHUT is a no-op if it's already closed.
+            GameFiber.Sleep(DoorCloseDelayMs);
+
+            if (!driver.Exists() || !vehicle.Exists())
+            {
+                return;
+            }
+
+            NativeFunction.Natives.SET_VEHICLE_DOOR_SHUT(vehicle, DriverDoorIndex, false);
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: " + label + ": vehicle door closed");
+
+            vehicle.IsEngineOn = true;
+
+            if (!driver.Exists() || !vehicle.Exists())
+            {
+                return;
+            }
+
+            NativeFunction.Natives.TASK_VEHICLE_DRIVE_WANDER(driver, vehicle, DepartureSpeed, NormalDrivingStyle);
+            Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision: " + label + ": driving task started");
+        }
+
+        /// <summary>
+        /// Polls until the driver is actually seated, not just mid-entry, or the timeout
+        /// elapses. IsInVehicle(vehicle, false) is required rather than the true overload,
+        /// since true can report the ped as "in" the vehicle while still in the process of
+        /// climbing in - issuing the driving task on that signal is what let the departure
+        /// race ahead of the entry animation.
+        /// </summary>
+        private static bool WaitUntilSeated(Ped driver, Vehicle vehicle, int timeoutMs)
+        {
+            var stopwatch = Stopwatch.StartNew();
+
+            while (stopwatch.ElapsedMilliseconds < timeoutMs)
+            {
+                if (!driver.Exists() || !vehicle.Exists())
+                {
+                    return false;
+                }
+
+                if (driver.IsInVehicle(vehicle, false))
+                {
+                    return true;
+                }
+
+                GameFiber.Yield();
+            }
+
+            return false;
         }
 
         private static bool IsVehicleDriveable(Vehicle vehicle)

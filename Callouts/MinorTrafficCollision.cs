@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using LSPD_First_Response.Mod.API;
 using LSPD_First_Response.Mod.Callouts;
 using Rage;
 using Rage.Native;
@@ -25,6 +26,11 @@ namespace RealPatrolCallouts.Callouts
         private const float MaxImpactGap = 1.5f;
         private const float MinVehicle2Rotation = 10f;
         private const float MaxVehicle2Rotation = 25f;
+
+        // Code 2 motor vehicle accident dispatch. IN_OR_ON_POSITION lets LSPDFR splice in its
+        // own location/street audio using CalloutPosition. Code 3 phrasing exists in the same
+        // scanner set for future serious-injury/multi-vehicle callouts - not used here.
+        private const string ScannerAudioString = "WE_HAVE CRIME_MOTOR_VEHICLE_ACCIDENT_02 IN_OR_ON_POSITION RESPOND_CODE_2";
 
         /// <summary>
         /// The patrol workflow this callout drives: arrive -&gt; investigate/interview
@@ -72,6 +78,8 @@ namespace RealPatrolCallouts.Callouts
 
             AddMinimumDistanceCheck(DispatchMinimumDistance, _calloutPosition);
             ShowCalloutAreaBlipBeforeAccepting(_calloutPosition, SceneBlipRadius);
+
+            Functions.PlayScannerAudioUsingPosition(ScannerAudioString, CalloutPosition);
 
             Game.LogTrivial("RealPatrolCallouts: MinorTrafficCollision offered");
 
