@@ -107,10 +107,12 @@ namespace RealPatrolCallouts.Callouts
 
             bool activePhotoMarkerInRange = false;
 
+            // VehiclePhotoTask renders its marker and handles its own T-press interaction
+            // on a dedicated GameFiber, so it no longer needs a per-tick Process() call here -
+            // only its resulting state is read.
             switch (_phase)
             {
                 case ScenePhase.PhotographingVehicle1:
-                    _photoTask1.Process();
                     activePhotoMarkerInRange = _photoTask1.IsPlayerInActiveMarkerRange;
                     if (_photoTask1.IsComplete)
                     {
@@ -119,7 +121,6 @@ namespace RealPatrolCallouts.Callouts
                     break;
 
                 case ScenePhase.PhotographingVehicle2:
-                    _photoTask2.Process();
                     activePhotoMarkerInRange = _photoTask2.IsPlayerInActiveMarkerRange;
                     if (_photoTask2.IsComplete)
                     {
